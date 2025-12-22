@@ -15,7 +15,6 @@ function extractTitle(t) {
   if (typeof t === 'string') return t;
   if (t.simpleText) return t.simpleText;
   if (Array.isArray(t.runs)) return t.runs.map((r) => r.text).join("");
-  if (t.text) return t.text;
   return "";
 }
 
@@ -40,91 +39,52 @@ async function extractInitialData(url) {
   return JSON.parse(match[1]);
 }
 
-async function fetchVideoInfo(videoId) {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const data = await extractInitialData(url);
-
-  const allTitles = findAllByKey(data, "title");
-  const mainVideo = allTitles.find(v => extractTitle(v.title) && (v.viewCount || v.dateText)) || {};
-
-  const viewText = findAllByKey(data, "viewCount")
-    .map(v => extractTitle(v.viewCount) || v.viewCount?.videoViewCountRenderer?.viewCount?.simpleText)
-    .find(t => t) || "0 回視聴";
-
-  const potentialVideos = findAllByKey(data, "videoId");
-  const relatedVideos = [];
-  const seenIds = new Set([videoId]);
-
-  for (const v of potentialVideos) {
-    if (v.videoId && !seenIds.has(v.videoId)) {
-      const title = extractTitle(v.title) || extractTitle(v.headline);
-      if (title) {
-        relatedVideos.push({
-          videoId: v.videoId,
-          title: title,
-          thumbnail: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          duration: extractTitle(v.lengthText) || "",
-          views: extractTitle(v.viewCountText) || extractTitle(v.shortViewCountText),
-          publishedDate: extractTitle(v.publishedTimeText),
-          channel: {
-            name: extractTitle(v.shortBylineText) || extractTitle(v.longBylineText) || extractTitle(v.ownerText),
-            channelId: v.navigationEndpoint?.browseEndpoint?.browseId || v.channelId
-          }
-        });
-        seenIds.add(v.videoId);
-      }
-    }
-    if (relatedVideos.length >= 20) break;
-  }
-
-  let description = "";
-  const structuredDesc = findAllByKey(data, "structuredDescriptionContentRenderer");
-  if (structuredDesc.length > 0) {
-    const runs = findAllByKey(structuredDesc[0], "runs");
-    description = runs.map(r => Array.isArray(r.runs) ? r.runs.map(p => p.text).join("") : "").join("\n");
-  }
-
-  if (!description || description.length < 10) {
-    const descParts = findAllByKey(data, "attributedDescription");
-    description = descParts.length > 0 ? extractTitle(descParts[0]) : "";
-  }
-
-  if (!description || description.length < 10) {
-    const allRuns = findAllByKey(data, "runs");
-    description = allRuns
-      .map(r => Array.isArray(r.runs) ? r.runs.map(p => p.text).join("") : "")
-      .filter(t => t.length > 30)
-      .sort((a, b) => b.length - a.length)[0] || "";
-  }
-
-  const owner = findAllByKey(data, "videoOwnerRenderer")[0]?.videoOwnerRenderer;
-
-  return {
-    videoId,
-    title: extractTitle(mainVideo.title) || "Untitled",
-    thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-    views: viewText,
-    publishedDate: extractTitle(mainVideo.dateText) || extractTitle(mainVideo.publishDate) || "",
-    channel: {
-      name: extractTitle(owner?.title) || extractTitle(mainVideo.shortBylineText) || "Unknown",
-      channelId: owner?.navigationEndpoint?.browseEndpoint?.browseId || ""
-    },
-    description: description.trim(),
-    url,
-    relatedVideos
-  };
-}
-
-app.get("/api/video/:videoid", async (req, res) => {
+app.get("/api/related/:videoid", async (req, res) => {
   try {
-    const info = await fetchVideoInfo(req.params.videoid);
-    res.json(info);
+    const videoId = req.params.videoid;
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const data = await extractInitialData(url);
+
+    const potentialVideos = findAllByKey(data, "videoId");
+    const relatedVideos = [];
+    const seenIds = new Set([videoId]);
+
+    for (const v of potentialVideos) {
+      const vid = v.videoId;
+      if (vid && !seenIds.has(vid)) {
+        const title = extractTitle(v.title) || extractTitle(v.headline);
+        
+        if (title) {
+          relatedVideos.push({
+            videoId: vid,
+            title: title,
+            thumbnail: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+            duration: extractTitle(v.lengthText) || extractTitle(v.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text) || "",
+            views: extractTitle(v.viewCountText) || extractTitle(v.shortViewCountText),
+            published: extractTitle(v.publishedTimeText),
+            author: {
+              name: extractTitle(v.shortBylineText) || extractTitle(v.longBylineText) || extractTitle(v.ownerText),
+              channelId: v.navigationEndpoint?.browseEndpoint?.browseId || v.channelId
+            }
+          });
+          seenIds.add(vid);
+        }
+      }
+      if (relatedVideos.length >= 40) break;
+    }
+
+    res.json({
+      baseVideoId: videoId,
+      count: relatedVideos.length,
+      relatedVideos
+    });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) => res.send("Video API is running"));
+app.get("/", (req, res) => res.send("Related Videos API is running"));
 
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
