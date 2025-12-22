@@ -1,6 +1,5 @@
 import express from "express";
 import fetch from "node-fetch";
-import vm from "vm";
 
 const app = express();
 const port = 3011;
@@ -10,10 +9,7 @@ const YT_API = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false";
 const headers = {
   "Content-Type": "application/json",
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
   "Accept-Language": "ja,en;q=0.9",
-  "x-youtube-client-name": "1",
-  "x-youtube-client-version": "2.20251207.11.00",
 };
 
 function extractTitle(t) {
@@ -27,7 +23,7 @@ function extractTitle(t) {
 function findAllByKey(obj, keyToFind) {
   let results = [];
   if (!obj || typeof obj !== 'object') return results;
-  if (obj[keyToFind]) results.push(obj);
+  if (obj[keyToFind] !== undefined) results.push(obj);
   Object.keys(obj).forEach(key => {
     if (typeof obj[key] === 'object') {
       results = results.concat(findAllByKey(obj[key], keyToFind));
@@ -36,47 +32,16 @@ function findAllByKey(obj, keyToFind) {
   return results;
 }
 
-async function convertImageToBase64(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
-    const ext = url.endsWith(".jpg") ? "jpg" : "webp";
-    return `data:image/${ext};base64,${Buffer.from(buf).toString("base64")}`;
-  } catch (err) {
-    return null;
-  }
-}
-
 async function fetchThumbnailWithFallback(vid) {
-  const urls = [
-    `https://i.ytimg.com/vi/${vid}/maxresdefault.jpg`,
-    `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
-    `https://i.ytimg.com/vi_webp/${vid}/default.webp`,
-    `https://i.ytimg.com/vi/${vid}/default.jpg`
-  ];
-  for (const url of urls) {
-    const data = await convertImageToBase64(url);
-    if (data) return data;
-  }
-  return null;
+  return `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
 }
 
 async function extractInitialData(url) {
-  try {
-    const html = await fetch(url, { headers }).then((r) => r.text());
-    const idx = html.indexOf("var ytInitialData =");
-    if (idx === -1) throw new Error("ytInitialData not found");
-    const start = html.indexOf("{", idx);
-    const end = html.indexOf("};", start) + 1;
-    const code = "ytInitialData=" + html.slice(start, end);
-    const ctx = {};
-    vm.createContext(ctx);
-    vm.runInContext(code, ctx);
-    return ctx.ytInitialData;
-  } catch (err) {
-    throw err;
-  }
+  const html = await fetch(url, { headers }).then((r) => r.text());
+  const regex = /var ytInitialData\s*=\s*({.+?});/s;
+  const match = html.match(regex);
+  if (!match) throw new Error("ytInitialData not found");
+  return JSON.parse(match[1]);
 }
 
 async function fetchVideoInfo(videoId) {
@@ -122,7 +87,7 @@ async function fetchVideoInfo(videoId) {
     description = extractTitle(descParts[0]);
   } else {
     const runs = findAllByKey(data, "runs")
-      .map(r => r.runs.map(p => p.text).join(""))
+      .map(r => r.runs ? r.runs.map(p => p.text).join("") : "")
       .filter(t => t.length > 50)
       .sort((a, b) => b.length - a.length)[0];
     description = runs || "";
@@ -130,12 +95,12 @@ async function fetchVideoInfo(videoId) {
 
   return {
     videoId,
-    title: extractTitle(mainVideo.title),
+    title: extractTitle(mainVideo.title) || "Untitled",
     thumbnail: await fetchThumbnailWithFallback(videoId),
     views: viewText,
     publishedDate: extractTitle(mainVideo.dateText) || extractTitle(mainVideo.publishDate),
     channel: {
-      name: extractTitle(mainVideo.owner?.videoOwnerRenderer?.title),
+      name: extractTitle(mainVideo.owner?.videoOwnerRenderer?.title) || "Unknown",
       channelId: mainVideo.owner?.videoOwnerRenderer?.navigationEndpoint?.browseEndpoint?.browseId
     },
     description: description.slice(0, 1000),
@@ -144,73 +109,12 @@ async function fetchVideoInfo(videoId) {
   };
 }
 
-function getTokenFromAppendAction(json) {
-  try {
-    const items = json?.onResponseReceivedActions?.[0]?.appendContinuationItemsAction?.continuationItems || [];
-    for (const it of items) {
-      const token = it?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-      if (token) return token;
-    }
-  } catch {}
-  return "";
-}
-
-async function handleRDPlaylist(listId, videoId) {
-  const url = `https://www.youtube.com/watch?v=${videoId}&list=${listId}`;
-  const data = await extractInitialData(url);
-  const playlist = data.contents?.twoColumnWatchNextResults?.playlist?.playlist || null;
-  if (!playlist) throw new Error("RD playlist not found");
-  const rawItems = playlist.contents || [];
-  const items = (await Promise.all(rawItems.map(async (entry) => {
-    const v = entry.playlistPanelVideoRenderer;
-    if (!v) return null;
-    return {
-      videoId: v.videoId,
-      title: extractTitle(v.title),
-      duration: v.lengthText?.simpleText || null,
-      author: extractTitle(v.longBylineText),
-      thumbnail: await fetchThumbnailWithFallback(v.videoId),
-    };
-  }))).filter(Boolean);
-  return {
-    playlistId: listId,
-    title: extractTitle(playlist.title),
-    items,
-    url
-  };
-}
-
-async function handleNormalPlaylist(listId, token) {
-  const body = {
-    context: { client: { hl: "ja", gl: "JP", clientName: "WEB", clientVersion: "2.20251207.11.00" } },
-    browseId: "VL" + listId
-  };
-  if (token) body.continuation = token;
-  const response = await fetch(YT_API, { method: "POST", headers, body: JSON.stringify(body) });
-  const json = await response.json();
-  const firstPageItems = json?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents || [];
-  const extractVideo = async (arr) => (await Promise.all(arr.map(async (v) => {
-    const data = v.playlistVideoRenderer;
-    if (!data) return null;
-    return {
-      videoId: data.videoId,
-      title: extractTitle(data.title),
-      thumbnail: await fetchThumbnailWithFallback(data.videoId)
-    };
-  }))).filter(Boolean);
-  const items = await extractVideo(firstPageItems);
-  return {
-    playlistId: listId,
-    items,
-    nextToken: getTokenFromAppendAction(json)
-  };
-}
-
 app.get("/api/video/:videoid", async (req, res) => {
   try {
     const info = await fetchVideoInfo(req.params.videoid);
     res.json(info);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -219,11 +123,17 @@ app.get("/playlist/:id", async (req, res) => {
   try {
     const listId = req.params.id;
     const videoId = req.query.v;
-    const token = req.query.token;
     if (listId.startsWith("RD")) {
-      return res.json(await handleRDPlaylist(listId, videoId));
+      const url = `https://www.youtube.com/watch?v=${videoId}&list=${listId}`;
+      const data = await extractInitialData(url);
+      const playlist = data.contents?.twoColumnWatchNextResults?.playlist?.playlist;
+      const items = (playlist?.contents || []).map(entry => {
+        const v = entry.playlistPanelVideoRenderer;
+        return v ? { videoId: v.videoId, title: extractTitle(v.title) } : null;
+      }).filter(Boolean);
+      return res.json({ playlistId: listId, title: extractTitle(playlist?.title), items });
     }
-    res.json(await handleNormalPlaylist(listId, token));
+    res.status(400).json({ error: "Only RD playlists supported in this minimal version" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
