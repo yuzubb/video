@@ -159,32 +159,44 @@ async function fetchVideoInfo(videoId) {
 
   // 関連動画取得
   const secondaryResults = results?.secondaryResults?.secondaryResults?.results || [];
+  
+  // compactVideoRenderer と videoWithContextRenderer の両方を探す
+  const relatedVideoRenderers = secondaryResults
+    .map((item) => item.compactVideoRenderer || item.videoWithContextRenderer)
+    .filter(Boolean)
+    .slice(0, 20); // 最初の20件まで
+  
   const relatedVideos = await Promise.all(
-    secondaryResults
-      .map((item) => item.compactVideoRenderer)
-      .filter(Boolean)
-      .slice(0, 20) // 最初の20件まで
-      .map(async (video) => {
-        const vid = video.videoId;
-        const thumb = await fetchThumbnailWithFallback(vid);
-        
-        return {
-          videoId: vid,
-          title: extractTitle(video.title),
-          thumbnail: thumb,
-          duration: video.lengthText?.simpleText || null,
-          views: video.viewCountText?.simpleText || null,
-          publishedDate: video.publishedTimeText?.simpleText || null,
-          channel: {
-            name: extractTitle(video.longBylineText) || 
-                   extractTitle(video.shortBylineText),
-            channelId: video.longBylineText?.runs?.[0]?.navigationEndpoint
-              ?.browseEndpoint?.browseId || 
-              video.channelId || null,
-          },
-        };
-      })
-  );
+    relatedVideoRenderers.map(async (video) => {
+      const vid = video.videoId;
+      if (!vid) return null;
+      
+      const thumb = await fetchThumbnailWithFallback(vid);
+      
+      // チャンネル情報の取得（複数のパターンに対応）
+      const channelInfo = video.longBylineText || video.shortBylineText;
+      const channelName = extractTitle(channelInfo);
+      const channelId = channelInfo?.runs?.[0]?.navigationEndpoint
+        ?.browseEndpoint?.browseId || video.channelId || null;
+      
+      return {
+        videoId: vid,
+        title: extractTitle(video.title) || extractTitle(video.headline),
+        thumbnail: thumb,
+        duration: video.lengthText?.simpleText || 
+                  video.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText || 
+                  null,
+        views: video.viewCountText?.simpleText || 
+               video.shortViewCountText?.simpleText || 
+               null,
+        publishedDate: video.publishedTimeText?.simpleText || null,
+        channel: {
+          name: channelName,
+          channelId: channelId,
+        },
+      };
+    })
+  ).then(results => results.filter(Boolean));
 
   return {
     videoId,
