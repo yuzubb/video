@@ -6,6 +6,7 @@ const app = express();
 const port = 3011;
 
 const YT_API = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false";
+const YT_PLAYER_API = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
 // ヘッダー
 const headers = {
@@ -51,12 +52,10 @@ function extractTitle(t) {
 async function convertImageToBase64(url) {
   try {
     const res = await fetch(url);
-
     if (!res.ok) {
       console.warn("[WARN] Thumbnail fetch failed:", url);
       return null;
     }
-
     const buf = await res.arrayBuffer();
     const ext = url.endsWith(".jpg") ? "jpg" : "webp";
     return `data:image/${ext};base64,${Buffer.from(buf).toString("base64")}`;
@@ -82,7 +81,7 @@ async function fetchThumbnailWithFallback(vid) {
   return null;
 }
 
-// ytInitialData 抽出（RD用）
+// ytInitialData 抽出
 async function extractInitialData(url) {
   try {
     const html = await fetch(url, { headers }).then((r) => r.text());
@@ -91,18 +90,119 @@ async function extractInitialData(url) {
 
     const start = html.indexOf("{", idx);
     const end = html.indexOf("};", start) + 1;
-
     const code = "ytInitialData=" + html.slice(start, end);
-    const ctx = {};
 
+    const ctx = {};
     vm.createContext(ctx);
     vm.runInContext(code, ctx);
-
     return ctx.ytInitialData;
   } catch (err) {
     console.error("[extractInitialData] Error:", err);
     throw err;
   }
+}
+
+// 動画情報取得
+async function fetchVideoInfo(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const data = await extractInitialData(url);
+
+  const results = data?.contents?.twoColumnWatchNextResults;
+  const primaryInfo =
+    results?.results?.results?.contents?.[0]?.videoPrimaryInfoRenderer;
+  const secondaryInfo =
+    results?.results?.results?.contents?.[1]?.videoSecondaryInfoRenderer;
+
+  if (!primaryInfo || !secondaryInfo) {
+    throw new Error("Video info not found");
+  }
+
+  // サムネイル取得
+  const thumbnail = await fetchThumbnailWithFallback(videoId);
+
+  // 視聴回数
+  const viewCountText =
+    primaryInfo?.viewCount?.videoViewCountRenderer?.viewCount?.simpleText ||
+    null;
+
+  // 公開日
+  const dateText = primaryInfo?.dateText?.simpleText || null;
+
+  // いいね数
+  const likeButton =
+    primaryInfo?.videoActions?.menuRenderer?.topLevelButtons?.find(
+      (btn) => btn.segmentedLikeDislikeButtonRenderer
+    );
+  const likeCount =
+    likeButton?.segmentedLikeDislikeButtonRenderer?.likeButton?.toggleButtonRenderer?.defaultText
+      ?.accessibility?.accessibilityData?.label || null;
+
+  // チャンネル情報
+  const owner = secondaryInfo?.owner?.videoOwnerRenderer;
+  const channelName = extractTitle(owner?.title);
+  const channelId =
+    owner?.navigationEndpoint?.browseEndpoint?.browseId || null;
+  const subscriberCount = extractTitle(owner?.subscriberCountText) || null;
+
+  // 説明文
+  const description = extractTitle(secondaryInfo?.attributedDescription) || null;
+
+  // カテゴリ・タグなどのメタデータ
+  const metadataRows =
+    secondaryInfo?.metadataRowContainer?.metadataRowContainerRenderer?.rows ||
+    [];
+  const category = metadataRows
+    .find((row) =>
+      extractTitle(row?.metadataRowRenderer?.title)?.includes("カテゴリ")
+    )
+    ?.metadataRowRenderer?.contents?.[0]?.runs?.[0]?.text || null;
+
+  // 関連動画取得
+  const secondaryResults = results?.secondaryResults?.secondaryResults?.results || [];
+  const relatedVideos = await Promise.all(
+    secondaryResults
+      .map((item) => item.compactVideoRenderer)
+      .filter(Boolean)
+      .slice(0, 20) // 最初の20件まで
+      .map(async (video) => {
+        const vid = video.videoId;
+        const thumb = await fetchThumbnailWithFallback(vid);
+        
+        return {
+          videoId: vid,
+          title: extractTitle(video.title),
+          thumbnail: thumb,
+          duration: video.lengthText?.simpleText || null,
+          views: video.viewCountText?.simpleText || null,
+          publishedDate: video.publishedTimeText?.simpleText || null,
+          channel: {
+            name: extractTitle(video.longBylineText) || 
+                   extractTitle(video.shortBylineText),
+            channelId: video.longBylineText?.runs?.[0]?.navigationEndpoint
+              ?.browseEndpoint?.browseId || 
+              video.channelId || null,
+          },
+        };
+      })
+  );
+
+  return {
+    videoId,
+    title: extractTitle(primaryInfo?.title),
+    thumbnail,
+    views: viewCountText,
+    publishedDate: dateText,
+    likes: likeCount,
+    channel: {
+      name: channelName,
+      channelId,
+      subscribers: subscriberCount,
+    },
+    description,
+    category,
+    url,
+    relatedVideos,
+  };
 }
 
 // token
@@ -146,13 +246,11 @@ async function handleRDPlaylist(listId, videoId) {
   if (!playlist) throw new Error("RD playlist not found");
 
   const rawItems = playlist.contents || [];
-
   const items = (
     await Promise.all(
       rawItems.map(async (entry) => {
         const v = entry.playlistPanelVideoRenderer;
         if (!v) return null;
-
         const vid = v.videoId;
 
         // サムネ取得
@@ -173,7 +271,6 @@ async function handleRDPlaylist(listId, videoId) {
   ).filter(Boolean);
 
   const title = extractTitle(playlist.title) || "ミックスリスト";
-
   const descRaw =
     playlist.description?.simpleText ||
     (Array.isArray(playlist.description?.runs)
@@ -184,8 +281,7 @@ async function handleRDPlaylist(listId, videoId) {
     playlistId: listId,
     title,
     author: "YouTube",
-    description:
-      descRaw || "Mixes are playlists automatically created by YouTube",
+    description: descRaw || "Mixes are playlists automatically created by YouTube",
     totalItems: `${items.length} 本`,
     views: null,
     url,
@@ -220,7 +316,6 @@ async function handleNormalPlaylist(listId, token) {
   });
 
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
   const json = await response.json();
 
   const meta = json?.metadata?.playlistMetadataRenderer || {};
@@ -268,7 +363,6 @@ async function handleNormalPlaylist(listId, token) {
   const continuationItems =
     json?.onResponseReceivedActions?.[0]?.appendContinuationItemsAction
       ?.continuationItems || [];
-
   const continuationVideos = await extractVideo(continuationItems);
 
   const items = [...firstVideos, ...continuationVideos];
@@ -293,7 +387,20 @@ async function handleNormalPlaylist(listId, token) {
   };
 }
 
-// ルート
+// 動画情報取得エンドポイント
+app.get("/api/video/:videoid", async (req, res) => {
+  const videoId = req.params.videoid;
+
+  try {
+    const videoInfo = await fetchVideoInfo(videoId);
+    return res.json(videoInfo);
+  } catch (err) {
+    console.error("[/api/video] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// プレイリスト取得エンドポイント
 app.get("/playlist/:id", async (req, res) => {
   const listId = req.params.id;
   const videoId = req.query.v || null;
