@@ -78,16 +78,23 @@ async function fetchVideoInfo(videoId) {
   }
 
   let description = "";
-  const descParts = findAllByKey(data, "attributedDescription");
-  if (descParts.length > 0 && extractTitle(descParts[0])) {
-    description = extractTitle(descParts[0]);
-  } else {
+  const structuredDesc = findAllByKey(data, "structuredDescriptionContentRenderer");
+  if (structuredDesc.length > 0) {
+    const runs = findAllByKey(structuredDesc[0], "runs");
+    description = runs.map(r => Array.isArray(r.runs) ? r.runs.map(p => p.text).join("") : "").join("\n");
+  }
+
+  if (!description || description.length < 10) {
+    const descParts = findAllByKey(data, "attributedDescription");
+    description = descParts.length > 0 ? extractTitle(descParts[0]) : "";
+  }
+
+  if (!description || description.length < 10) {
     const allRuns = findAllByKey(data, "runs");
-    const longestRun = allRuns
+    description = allRuns
       .map(r => Array.isArray(r.runs) ? r.runs.map(p => p.text).join("") : "")
       .filter(t => t.length > 30)
-      .sort((a, b) => b.length - a.length)[0];
-    description = longestRun || "";
+      .sort((a, b) => b.length - a.length)[0] || "";
   }
 
   const owner = findAllByKey(data, "videoOwnerRenderer")[0]?.videoOwnerRenderer;
@@ -102,7 +109,7 @@ async function fetchVideoInfo(videoId) {
       name: extractTitle(owner?.title) || extractTitle(mainVideo.shortBylineText) || "Unknown",
       channelId: owner?.navigationEndpoint?.browseEndpoint?.browseId || ""
     },
-    description: (description || "").slice(0, 1000),
+    description: description.trim(),
     url,
     relatedVideos
   };
@@ -117,31 +124,7 @@ app.get("/api/video/:videoid", async (req, res) => {
   }
 });
 
-app.get("/playlist/:id", async (req, res) => {
-  try {
-    const listId = req.params.id;
-    const videoId = req.query.v;
-    if (listId.startsWith("RD")) {
-      const url = `https://www.youtube.com/watch?v=${videoId}&list=${listId}`;
-      const data = await extractInitialData(url);
-      const playlist = data.contents?.twoColumnWatchNextResults?.playlist?.playlist;
-      const items = (playlist?.contents || []).map(entry => {
-        const v = entry.playlistPanelVideoRenderer;
-        return v ? { 
-          videoId: v.videoId, 
-          title: extractTitle(v.title),
-          thumbnail: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
-        } : null;
-      }).filter(Boolean);
-      return res.json({ playlistId: listId, title: extractTitle(playlist?.title), items });
-    }
-    res.status(400).json({ error: "Only RD playlists supported" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/", (req, res) => res.send("YouTube Data Proxy is running"));
+app.get("/", (req, res) => res.send("Video API is running"));
 
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
