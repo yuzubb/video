@@ -30,6 +30,16 @@ function findAllByKey(obj, keyToFind) {
   return results;
 }
 
+function findContinuationToken(obj) {
+  const continuations = findAllByKey(obj, "continuation");
+  for (const c of continuations) {
+    if (c.continuation && typeof c.continuation === 'string') {
+      return c.continuation;
+    }
+  }
+  return null;
+}
+
 async function extractInitialData(url) {
   const res = await fetch(url, { headers });
   const html = await res.text();
@@ -39,46 +49,87 @@ async function extractInitialData(url) {
   return JSON.parse(match[1]);
 }
 
+async function fetchMoreRelated(continuation) {
+  const url = "https://www.youtube.com/youtubei/v1/next?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const body = {
+    continuation: continuation,
+    context: {
+      client: {
+        clientName: "WEB",
+        clientVersion: "2.20231201.00.00"
+      }
+    }
+  };
+  
+  const res = await fetch(url, {
+    method: "POST",
+    headers: headers,
+    body: JSON.stringify(body)
+  });
+  
+  return await res.json();
+}
+
 app.get("/api/related/:videoid", async (req, res) => {
   try {
     const videoId = req.params.videoid;
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     const data = await extractInitialData(url);
-
-    const potentialVideos = findAllByKey(data, "videoId");
+    
     const relatedVideos = [];
     const seenIds = new Set([videoId]);
-
-    for (const v of potentialVideos) {
-      const vid = v.videoId;
-      if (vid && !seenIds.has(vid)) {
-        const title = extractTitle(v.title) || extractTitle(v.headline);
-        
-        if (title) {
-          relatedVideos.push({
-            videoId: vid,
-            title: title,
-            thumbnail: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
-            duration: extractTitle(v.lengthText) || extractTitle(v.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text) || "",
-            views: extractTitle(v.viewCountText) || extractTitle(v.shortViewCountText),
-            published: extractTitle(v.publishedTimeText),
-            author: {
-              name: extractTitle(v.shortBylineText) || extractTitle(v.longBylineText) || extractTitle(v.ownerText),
-              channelId: v.navigationEndpoint?.browseEndpoint?.browseId || v.channelId
-            }
-          });
-          seenIds.add(vid);
+    
+    // 初期データから動画を抽出
+    function extractVideos(dataObj) {
+      const potentialVideos = findAllByKey(dataObj, "videoId");
+      for (const v of potentialVideos) {
+        const vid = v.videoId;
+        if (vid && !seenIds.has(vid)) {
+          const title = extractTitle(v.title) || extractTitle(v.headline);
+          if (title) {
+            relatedVideos.push({
+              videoId: vid,
+              title: title,
+              thumbnail: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+              duration: extractTitle(v.lengthText) || extractTitle(v.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text) || "",
+              views: extractTitle(v.viewCountText) || extractTitle(v.shortViewCountText),
+              published: extractTitle(v.publishedTimeText),
+              author: {
+                name: extractTitle(v.shortBylineText) || extractTitle(v.longBylineText) || extractTitle(v.ownerText),
+                channelId: v.navigationEndpoint?.browseEndpoint?.browseId || v.channelId
+              }
+            });
+            seenIds.add(vid);
+          }
         }
+        if (relatedVideos.length >= 50) break;
       }
-      if (relatedVideos.length >= 40) break;
     }
-
+    
+    extractVideos(data);
+    
+    // 50個に達していない場合、continuationで追加取得
+    let continuation = findContinuationToken(data);
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    while (relatedVideos.length < 50 && continuation && attempts < maxAttempts) {
+      attempts++;
+      try {
+        const moreData = await fetchMoreRelated(continuation);
+        extractVideos(moreData);
+        continuation = findContinuationToken(moreData);
+      } catch (err) {
+        console.error("Failed to fetch more videos:", err.message);
+        break;
+      }
+    }
+    
     res.json({
       baseVideoId: videoId,
       count: relatedVideos.length,
       relatedVideos
     });
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
