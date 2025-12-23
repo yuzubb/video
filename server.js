@@ -61,14 +61,12 @@ async function extractInitialData(url) {
   const res = await fetch(url, { headers });
   const html = await res.text();
   
-  // ytInitialDataを取得
   const regex = /var ytInitialData\s*=\s*({.+?});/s;
   const match = html.match(regex);
   if (!match) throw new Error("ytInitialData not found");
   
   const data = JSON.parse(match[1]);
   
-  // APIキーも抽出
   const keyRegex = /"INNERTUBE_API_KEY":"([^"]+)"/;
   const keyMatch = html.match(keyRegex);
   const apiKey = keyMatch ? keyMatch[1] : "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
@@ -76,8 +74,8 @@ async function extractInitialData(url) {
   return { data, apiKey };
 }
 
-async function fetchMoreRelated(continuation, apiKey) {
-  const url = `https://www.youtube.com/youtubei/v1/next?key=${apiKey}`;
+async function fetchMoreVideos(continuation, apiKey) {
+  const url = `https://www.youtube.com/youtubei/v1/browse?key=${apiKey}`;
   const body = {
     continuation: continuation,
     context: {
@@ -98,7 +96,6 @@ async function fetchMoreRelated(continuation, apiKey) {
 }
 
 function extractVideoFromRenderer(v) {
-  // compactVideoRenderer または gridVideoRenderer から情報を抽出
   const vid = v.videoId;
   if (!vid) return null;
   
@@ -119,68 +116,69 @@ function extractVideoFromRenderer(v) {
   };
 }
 
-app.get("/api/related/:videoid", async (req, res) => {
+app.get("/api/trending", async (req, res) => {
   try {
-    const videoId = req.params.videoid;
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const url = "https://www.youtube.com";
     const { data, apiKey } = await extractInitialData(url);
     
-    const relatedVideos = [];
-    const seenIds = new Set([videoId]);
+    const videos = [];
+    const seenIds = new Set();
     
-    // 関連動画を抽出する関数
     function extractVideos(dataObj) {
-      // compactVideoRenderer を探す（関連動画セクション）
-      const compactRenderers = findAllByKey(dataObj, "compactVideoRenderer");
-      for (const renderer of compactRenderers) {
-        const video = extractVideoFromRenderer(renderer.compactVideoRenderer);
-        if (video && !seenIds.has(video.videoId)) {
-          relatedVideos.push(video);
-          seenIds.add(video.videoId);
-          if (relatedVideos.length >= 50) return;
+      // richItemRenderer (ホーム画面の動画)
+      const richItems = findAllByKey(dataObj, "richItemRenderer");
+      for (const item of richItems) {
+        const content = item.richItemRenderer?.content?.videoRenderer;
+        if (content) {
+          const video = extractVideoFromRenderer(content);
+          if (video && !seenIds.has(video.videoId)) {
+            videos.push(video);
+            seenIds.add(video.videoId);
+          }
         }
       }
       
-      // gridVideoRenderer も探す
+      // gridVideoRenderer
       const gridRenderers = findAllByKey(dataObj, "gridVideoRenderer");
       for (const renderer of gridRenderers) {
         const video = extractVideoFromRenderer(renderer.gridVideoRenderer);
         if (video && !seenIds.has(video.videoId)) {
-          relatedVideos.push(video);
+          videos.push(video);
           seenIds.add(video.videoId);
-          if (relatedVideos.length >= 50) return;
         }
       }
       
-      // 念のため通常のvideoIdも探す
-      const potentialVideos = findAllByKey(dataObj, "videoId");
-      for (const v of potentialVideos) {
-        const video = extractVideoFromRenderer(v);
+      // videoRenderer (一般的な動画レンダラー)
+      const videoRenderers = findAllByKey(dataObj, "videoRenderer");
+      for (const renderer of videoRenderers) {
+        const video = extractVideoFromRenderer(renderer.videoRenderer);
         if (video && !seenIds.has(video.videoId)) {
-          relatedVideos.push(video);
+          videos.push(video);
           seenIds.add(video.videoId);
-          if (relatedVideos.length >= 50) return;
         }
       }
     }
     
-    // 初期データから抽出
     extractVideos(data);
     
-    // continuationで追加取得
     let continuation = findContinuationToken(data);
     let attempts = 0;
-    const maxAttempts = 5;
+    const maxAttempts = 20;
     
-    while (relatedVideos.length < 50 && continuation && attempts < maxAttempts) {
+    while (continuation && attempts < maxAttempts) {
       attempts++;
       try {
-        const moreData = await fetchMoreRelated(continuation, apiKey);
+        const moreData = await fetchMoreVideos(continuation, apiKey);
+        const prevCount = videos.length;
         extractVideos(moreData);
-        continuation = findContinuationToken(moreData);
         
-        // continuationが見つからない場合は終了
-        if (!continuation) break;
+        const newContinuation = findContinuationToken(moreData);
+        
+        if (!newContinuation || videos.length === prevCount) {
+          break;
+        }
+        
+        continuation = newContinuation;
       } catch (err) {
         console.error(`Attempt ${attempts} failed:`, err.message);
         break;
@@ -188,16 +186,16 @@ app.get("/api/related/:videoid", async (req, res) => {
     }
     
     res.json({
-      baseVideoId: videoId,
-      count: relatedVideos.length,
-      relatedVideos
+      count: videos.length,
+      attempts: attempts,
+      videos
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) => res.send("Related Videos API is running"));
+app.get("/", (req, res) => res.send("YouTube Trending Videos API is running"));
 
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
