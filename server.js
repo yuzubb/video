@@ -18,21 +18,38 @@ function extractTitle(t) {
   return "";
 }
 
-function findAllByKey(obj, keyToFind) {
+function findAllByKey(obj, keyToFind, maxDepth = 50, currentDepth = 0) {
   let results = [];
-  if (!obj || typeof obj !== 'object') return results;
+  if (!obj || typeof obj !== 'object' || currentDepth > maxDepth) return results;
+  
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      results = results.concat(findAllByKey(item, keyToFind, maxDepth, currentDepth + 1));
+    }
+    return results;
+  }
+  
   if (obj[keyToFind] !== undefined) results.push(obj);
+  
   Object.keys(obj).forEach(key => {
     if (typeof obj[key] === 'object') {
-      results = results.concat(findAllByKey(obj[key], keyToFind));
+      results = results.concat(findAllByKey(obj[key], keyToFind, maxDepth, currentDepth + 1));
     }
   });
   return results;
 }
 
 function findContinuationToken(obj) {
-  const continuations = findAllByKey(obj, "continuation");
+  const continuations = findAllByKey(obj, "continuationCommand");
   for (const c of continuations) {
+    const token = c.continuationCommand?.token || c.token;
+    if (token && typeof token === 'string') {
+      return token;
+    }
+  }
+  
+  const continuations2 = findAllByKey(obj, "continuation");
+  for (const c of continuations2) {
     if (c.continuation && typeof c.continuation === 'string') {
       return c.continuation;
     }
@@ -43,14 +60,24 @@ function findContinuationToken(obj) {
 async function extractInitialData(url) {
   const res = await fetch(url, { headers });
   const html = await res.text();
+  
+  // ytInitialDataを取得
   const regex = /var ytInitialData\s*=\s*({.+?});/s;
   const match = html.match(regex);
   if (!match) throw new Error("ytInitialData not found");
-  return JSON.parse(match[1]);
+  
+  const data = JSON.parse(match[1]);
+  
+  // APIキーも抽出
+  const keyRegex = /"INNERTUBE_API_KEY":"([^"]+)"/;
+  const keyMatch = html.match(keyRegex);
+  const apiKey = keyMatch ? keyMatch[1] : "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  
+  return { data, apiKey };
 }
 
-async function fetchMoreRelated(continuation) {
-  const url = "https://www.youtube.com/youtubei/v1/next?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+async function fetchMoreRelated(continuation, apiKey) {
+  const url = `https://www.youtube.com/youtubei/v1/next?key=${apiKey}`;
   const body = {
     continuation: continuation,
     context: {
@@ -70,57 +97,92 @@ async function fetchMoreRelated(continuation) {
   return await res.json();
 }
 
+function extractVideoFromRenderer(v) {
+  // compactVideoRenderer または gridVideoRenderer から情報を抽出
+  const vid = v.videoId;
+  if (!vid) return null;
+  
+  const title = extractTitle(v.title) || extractTitle(v.headline);
+  if (!title) return null;
+  
+  return {
+    videoId: vid,
+    title: title,
+    thumbnail: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+    duration: extractTitle(v.lengthText) || extractTitle(v.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text) || "",
+    views: extractTitle(v.viewCountText) || extractTitle(v.shortViewCountText) || "",
+    published: extractTitle(v.publishedTimeText) || "",
+    author: {
+      name: extractTitle(v.shortBylineText) || extractTitle(v.longBylineText) || extractTitle(v.ownerText) || "",
+      channelId: v.navigationEndpoint?.browseEndpoint?.browseId || v.channelId || ""
+    }
+  };
+}
+
 app.get("/api/related/:videoid", async (req, res) => {
   try {
     const videoId = req.params.videoid;
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const data = await extractInitialData(url);
+    const { data, apiKey } = await extractInitialData(url);
     
     const relatedVideos = [];
     const seenIds = new Set([videoId]);
     
-    // 初期データから動画を抽出
+    // 関連動画を抽出する関数
     function extractVideos(dataObj) {
+      // compactVideoRenderer を探す（関連動画セクション）
+      const compactRenderers = findAllByKey(dataObj, "compactVideoRenderer");
+      for (const renderer of compactRenderers) {
+        const video = extractVideoFromRenderer(renderer.compactVideoRenderer);
+        if (video && !seenIds.has(video.videoId)) {
+          relatedVideos.push(video);
+          seenIds.add(video.videoId);
+          if (relatedVideos.length >= 50) return;
+        }
+      }
+      
+      // gridVideoRenderer も探す
+      const gridRenderers = findAllByKey(dataObj, "gridVideoRenderer");
+      for (const renderer of gridRenderers) {
+        const video = extractVideoFromRenderer(renderer.gridVideoRenderer);
+        if (video && !seenIds.has(video.videoId)) {
+          relatedVideos.push(video);
+          seenIds.add(video.videoId);
+          if (relatedVideos.length >= 50) return;
+        }
+      }
+      
+      // 念のため通常のvideoIdも探す
       const potentialVideos = findAllByKey(dataObj, "videoId");
       for (const v of potentialVideos) {
-        const vid = v.videoId;
-        if (vid && !seenIds.has(vid)) {
-          const title = extractTitle(v.title) || extractTitle(v.headline);
-          if (title) {
-            relatedVideos.push({
-              videoId: vid,
-              title: title,
-              thumbnail: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
-              duration: extractTitle(v.lengthText) || extractTitle(v.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text) || "",
-              views: extractTitle(v.viewCountText) || extractTitle(v.shortViewCountText),
-              published: extractTitle(v.publishedTimeText),
-              author: {
-                name: extractTitle(v.shortBylineText) || extractTitle(v.longBylineText) || extractTitle(v.ownerText),
-                channelId: v.navigationEndpoint?.browseEndpoint?.browseId || v.channelId
-              }
-            });
-            seenIds.add(vid);
-          }
+        const video = extractVideoFromRenderer(v);
+        if (video && !seenIds.has(video.videoId)) {
+          relatedVideos.push(video);
+          seenIds.add(video.videoId);
+          if (relatedVideos.length >= 50) return;
         }
-        if (relatedVideos.length >= 50) break;
       }
     }
     
+    // 初期データから抽出
     extractVideos(data);
     
-    // 50個に達していない場合、continuationで追加取得
+    // continuationで追加取得
     let continuation = findContinuationToken(data);
     let attempts = 0;
-    const maxAttempts = 3;
+    const maxAttempts = 5;
     
     while (relatedVideos.length < 50 && continuation && attempts < maxAttempts) {
       attempts++;
       try {
-        const moreData = await fetchMoreRelated(continuation);
+        const moreData = await fetchMoreRelated(continuation, apiKey);
         extractVideos(moreData);
         continuation = findContinuationToken(moreData);
+        
+        // continuationが見つからない場合は終了
+        if (!continuation) break;
       } catch (err) {
-        console.error("Failed to fetch more videos:", err.message);
+        console.error(`Attempt ${attempts} failed:`, err.message);
         break;
       }
     }
